@@ -1,0 +1,22 @@
+FROM python:3.10-slim
+
+# Set working directory
+WORKDIR /agent
+
+# Install git and system dependencies
+RUN apt-get update && apt-get install -y \
+    git \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install pytest and common testing tools
+RUN pip install --no-cache-dir pytest pytest-cov pytest-xdist
+
+# This is the agent that will run inside a sandboxed environment
+# The actual repo code and its dependencies will be installed at runtime
+
+# Copy the entrypoint script
+COPY docker/agent_entrypoint.py .
+
+# Set entrypoint
+ENTRYPOINT ["python", "agent_entrypoint.py"]
