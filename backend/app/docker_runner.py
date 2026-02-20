@@ -4,13 +4,15 @@ import json
 import threading
 import time
 import sys
-import venv
+import venv  # Still needed for fallback local execution
 from typing import List, Dict
 from app.models import ErrorInfo, FixResult, AgentResponse, ErrorType
 from app.parser import ErrorParser
 from app.fixer import FixEngine
 from app.git_utils import GitHandler
+from app.docker_executor import DockerExecutor
 from app.config import WORKSPACE_DIR, RESULTS_FILE, TEST_COMMAND
+from app.languages import detect_language, get_language_plugin, LanguagePlugin
 
 
 class DockerRunner:
@@ -26,14 +28,18 @@ class DockerRunner:
         
         # Initialize components
         self.git_handler = GitHandler(WORKSPACE_DIR)
-        self.parser = ErrorParser()
-        self.fixer: FixEngine = None
+        self.parser = ErrorParser()  # Legacy Python parser (fallback)
+        self.fixer: FixEngine = None  # Legacy Python fixer (fallback)
+        
+        # Language plugin system
+        self.language = None
+        self.language_plugin: LanguagePlugin = None
+        self.docker_executor = None  # Will be initialized after language detection
         
         # Project type detection
         self.project_type = None  # 'python', 'javascript', or 'unknown'
         self.test_command = None
-        self.venv_path = None
-        self.venv_python = None
+        self.use_docker = True  # Use Docker by default
         
         # Tracking
         self.fixes: List[FixResult] = []
@@ -48,118 +54,213 @@ class DockerRunner:
     
     def run(self) -> AgentResponse:
         """Main execution flow"""
-        self._emit_progress("info", f"🔍 Starting AI DevOps Agent for {self.repo_url}")
-        print(f"Starting AI DevOps Agent for {self.repo_url}")
-        
-        # Step 1: Clone repository
-        self._emit_progress("cloning", "📥 Cloning repository...")
-        repo_path = self.git_handler.clone_repo(self.repo_url)
-        self.fixer = FixEngine(repo_path)
-        self._emit_progress("success", "✅ Repository cloned successfully")
-        
-        # Step 1.5: Detect project type
-        self._emit_progress("analyzing", "🔍 Detecting project type...")
-        self._detect_project_type(repo_path)
-        self._emit_progress("info", f"📋 Detected {self.project_type} project")
-                # Step 2.5: Create virtual environment for Python projects
-        if self.project_type == 'python':
-            self._emit_progress("venv", "🔧 Creating isolated Python environment...")
-            self._create_venv(repo_path)
-            self._emit_progress("success", "✅ Virtual environment created")
-                # Step 2: Install dependencies
-        self._emit_progress("installing", "📦 Installing dependencies...")
-        self._install_dependencies(repo_path)
-        self._emit_progress("success", "✅ Dependencies installed")
-        
-        # Step 3: Create new branch
-        self._emit_progress("info", "🌿 Creating feature branch...")
-        branch_name = self.git_handler.create_branch(self.team, self.leader)
-        self._emit_progress("success", f"✅ Branch created: {branch_name}")
-        
-        # Step 4: Iterative fix loop
-        for iteration in range(self.max_retries):
-            self.iterations = iteration + 1
-            print(f"\n=== Iteration {self.iterations} ===")
-            self._emit_progress("testing", f"🧪 Running tests (Iteration {self.iterations}/{self.max_retries})...")
+        try:
+            self._emit_progress("info", f"🔍 Starting AI DevOps Agent for {self.repo_url}")
+            print(f"Starting AI DevOps Agent for {self.repo_url}")
             
-            # Run tests
-            test_output = self._run_tests(repo_path)
+            # Step 1: Clone repository
+            self._emit_progress("cloning", "📥 Cloning repository...")
+            repo_path = self.git_handler.clone_repo(self.repo_url)
+            self.fixer = FixEngine(repo_path)
+            self._emit_progress("success", "✅ Repository cloned successfully")
             
-            # Parse errors (pass repo_path to filter out system library errors)
-            errors = self.parser.parse_errors(test_output, repo_path=repo_path)
+            # Step 1.5: Detect language and load plugin
+            self._emit_progress("analyzing", "🔍 Detecting project type...")
+            self.language = detect_language(repo_path)
+            self.language_plugin = get_language_plugin(self.language)
+            self._detect_project_type(repo_path)  # Keep for compatibility
+            self._emit_progress("info", f"📋 Detected {self.language} project")
             
-            if not errors:
-                print("No errors found! Tests passed.")
-                self._emit_progress("success", "✅ All tests passed!")
-                break
+            # Check JavaScript project configuration
+            if self.language in ['javascript', 'typescript']:
+                self._check_javascript_config(repo_path)
             
-            print(f"Found {len(errors)} errors")
-            self.total_failures = len(errors)
-            self._emit_progress("warning", f"⚠️ Found {len(errors)} error(s) to fix")
+            # Initialize DockerExecutor with language-specific image
+            docker_image = self.language_plugin.get_docker_image()
+            self.docker_executor = DockerExecutor(image_name=docker_image)
+            print(f"🐳 Using Docker image: {docker_image}")
             
-            # Apply fixes
-            self._emit_progress("fixing", f"🔧 Applying fixes to {len(errors)} error(s)...")
-            fixed_count = 0
-            for error in errors:
-                if self._apply_and_commit_fix(error):
-                    fixed_count += 1
+            # Step 2: Check Docker availability
+            if self.docker_executor.check_docker_available():
+                self._emit_progress("docker", "🐳 Docker detected, using containerized execution")
+                self.use_docker = True
+                
+                # Ensure Docker image is built
+                if not self.docker_executor.check_image_exists():
+                    self._emit_progress("docker", "🔨 Building Docker image (one-time setup)...")
+                    
+                    # Determine Dockerfile based on language
+                    dockerfile_map = {
+                        'python': 'docker/Dockerfile.agent',
+                        'javascript': 'docker/Dockerfile.agent.node',
+                        'typescript': 'docker/Dockerfile.agent.node',
+                    }
+                    dockerfile_path = dockerfile_map.get(self.language, 'docker/Dockerfile.agent')
+                    
+                    if self.docker_executor.build_image(dockerfile_path=dockerfile_path):
+                        self._emit_progress("success", "✅ Docker image ready")
+                    else:
+                        self._emit_progress("warning", "⚠️ Docker build failed, falling back to local execution")
+                        self.use_docker = False
+            else:
+                self._emit_progress("warning", "⚠️ Docker not available, using local execution")
+                self.use_docker = False
             
-            print(f"Applied {fixed_count} fixes in iteration {self.iterations}")
-            self._emit_progress("info", f"✅ Applied {fixed_count} fix(es) in iteration {self.iterations}")
+            # Step 3: Create new branch
+            self._emit_progress("info", "🌿 Creating feature branch...")
+            branch_name = self.git_handler.create_branch(self.team, self.leader)
+            self._emit_progress("success", f"✅ Branch created: {branch_name}")
             
-            # If no fixes were applied, break to avoid infinite loop
-            if fixed_count == 0:
-                print("No fixes could be applied. Stopping.")
-                self._emit_progress("error", "❌ No fixes could be applied. Stopping iterations.")
-                break
+            # Step 4: Iterative fix loop
+            for iteration in range(self.max_retries):
+                self.iterations = iteration + 1
+                print(f"\n=== Iteration {self.iterations} ===")
+                self._emit_progress("testing", f"🧪 Running tests (Iteration {self.iterations}/{self.max_retries})...")
+                
+                # Run tests
+                test_output = self._run_tests(repo_path)
+                
+                # Parse errors using language plugin
+                errors = self.language_plugin.parse_errors(test_output, repo_path=repo_path)
+                
+                if not errors:
+                    print("No errors found! Tests passed.")
+                    self._emit_progress("success", "✅ All tests passed!")
+                    break
+                
+                print(f"Found {len(errors)} errors")
+                self.total_failures = len(errors)
+                self._emit_progress("warning", f"⚠️ Found {len(errors)} error(s) to fix")
+                
+                # Apply fixes
+                self._emit_progress("fixing", f"🔧 Applying fixes to {len(errors)} error(s)...")
+                fixed_count = 0
+                for error in errors:
+                    if self._apply_and_commit_fix(error):
+                        fixed_count += 1
+                
+                print(f"Applied {fixed_count} fixes in iteration {self.iterations}")
+                self._emit_progress("info", f"✅ Applied {fixed_count} fix(es) in iteration {self.iterations}")
+                
+                # If no fixes were applied, break to avoid infinite loop
+                if fixed_count == 0:
+                    print("No fixes could be applied. Stopping.")
+                    self._emit_progress("error", "❌ No fixes could be applied. Stopping iterations.")
+                    break
+            
+            # Step 5: Push branch (only if fixes were applied)
+            if len(self.fixes) > 0:
+                self._emit_progress("pushing", "📤 Pushing changes to GitHub...")
+                try:
+                    self.git_handler.push_branch(branch_name)
+                    self._emit_progress("success", f"✅ Branch pushed: {branch_name}")
+                except Exception as e:
+                    self._emit_progress("error", f"❌ Failed to push branch: {str(e)}")
+                    print(f"Error pushing branch: {e}")
+            else:
+                self._emit_progress("warning", "⚠️ No fixes were applied, skipping push")
+                print("No fixes applied, skipping push")
+            
+            # Step 6: Generate response
+            self._emit_progress("completing", "📊 Generating final report...")
+            response = self._generate_response(branch_name)
+            self._emit_progress("completed", f"✅ Agent run completed! Status: {response.status}", {
+                "status": response.status,
+                "total_fixes": response.total_fixes,
+                "total_failures": response.total_failures,
+                "iterations": response.iterations,
+                "branch": branch_name
+            })
+            
+            # Step 7: Save results.json
+            self._save_results(response)
+            
+            return response
+        finally:
+            # Always cleanup Git resources to release file handles
+            if hasattr(self, 'git_handler'):
+                self.git_handler.close()
+    
+    def _check_javascript_config(self, repo_path: str):
+        """Check JavaScript project configuration and adjust test strategy"""
+        package_json_path = os.path.join(repo_path, 'package.json')
         
-        # Step 5: Push branch (only if fixes were applied)
-        if len(self.fixes) > 0:
-            self._emit_progress("pushing", "📤 Pushing changes to GitHub...")
-            try:
-                self.git_handler.push_branch(branch_name)
-                self._emit_progress("success", f"✅ Branch pushed: {branch_name}")
-            except Exception as e:
-                self._emit_progress("error", f"❌ Failed to push branch: {str(e)}")
-                print(f"Error pushing branch: {e}")
-        else:
-            self._emit_progress("warning", "⚠️ No fixes were applied, skipping push")
-            print("No fixes applied, skipping push")
+        if not os.path.exists(package_json_path):
+            return
         
-        # Step 6: Generate response
-        self._emit_progress("completing", "📊 Generating final report...")
-        response = self._generate_response(branch_name)
-        self._emit_progress("completed", f"✅ Agent run completed! Status: {response.status}", {
-            "status": response.status,
-            "total_fixes": response.total_fixes,
-            "total_failures": response.total_failures,
-            "iterations": response.iterations,
-            "branch": branch_name
-        })
-        
-        # Step 7: Save results.json
-        self._save_results(response)
-        
-        return response
+        try:
+            with open(package_json_path, 'r', encoding='utf-8') as f:
+                package_data = json.load(f)
+            
+            scripts = package_data.get('scripts', {})
+            
+            # Check if test script exists
+            if 'test' not in scripts:
+                print("⚠️  No test script found in package.json")
+                self._emit_progress("warning", "⚠️ No test script configured")
+                
+                # Check for alternative scripts
+                if 'lint' in scripts:
+                    print("✓ Found lint script, will use for code analysis")
+                    self._emit_progress("info", "📋 Using ESLint for code analysis")
+                    # Update plugin's test command to use lint
+                    from app.languages.javascript_plugin import JavaScriptPlugin
+                    if isinstance(self.language_plugin, JavaScriptPlugin):
+                        # Override test command to use lint
+                        self.test_command = ['npm', 'run', 'lint']
+                        print(f"📋 Updated test command: {' '.join(self.test_command)}")
+                elif 'build' in scripts:
+                    print("✓ Found build script, will use for error detection")
+                    self._emit_progress("info", "📋 Using build for error detection")
+                    self.test_command = ['npm', 'run', 'build']
+                else:
+                    print("⚠️  No test, lint, or build scripts found")
+                    self._emit_progress("warning", "⚠️ No testable scripts found in package.json")
+            else:
+                test_script = scripts['test']
+                print(f"✓ Found test script: {test_script}")
+                
+                # Check if it's a placeholder
+                if 'no test' in test_script.lower() or 'echo' in test_script.lower():
+                    print("⚠️  Test script is a placeholder")
+                    self._emit_progress("warning", "⚠️ Test script is not configured")
+                    
+                    # Try lint as fallback
+                    if 'lint' in scripts:
+                        print("✓ Falling back to lint script")
+                        self.test_command = ['npm', 'run', 'lint']
+                    
+        except Exception as e:
+            print(f"⚠️  Error reading package.json: {e}")
     
     def _detect_project_type(self, repo_path: str):
-        """Detect if project is Python or JavaScript/React"""
-        package_json = os.path.join(repo_path, 'package.json')
-        requirements_txt = os.path.join(repo_path, 'requirements.txt')
+        """Detect if project is Python or JavaScript/React (legacy, kept for compatibility)"""
+        # Note: Language detection now happens via language plugin
+        # This method is kept for backward compatibility
+        self.project_type = self.language  # Use detected language
         
-        if os.path.exists(package_json):
-            self.project_type = 'javascript'
-            self.test_command = ['npm', 'test', '--', '--passWithNoTests']
-            print("📦 Detected JavaScript/React project (package.json found)")
-        elif os.path.exists(requirements_txt):
-            self.project_type = 'python'
-            self.test_command = ['pytest', '--maxfail=10', '-v']
-            print("🐍 Detected Python project (requirements.txt found)")
+        # Use language plugin's test command
+        if self.language_plugin:
+            self.test_command = self.language_plugin.get_test_command()
+            print(f"📋 Using test command from {self.language} plugin: {' '.join(self.test_command)}")
         else:
-            # Default to Python with pytest
-            self.project_type = 'unknown'
-            self.test_command = ['pytest', '--maxfail=10', '-v']
-            print("⚠️  Could not detect project type, defaulting to Python/pytest")
+            # Fallback to old detection logic
+            package_json = os.path.join(repo_path, 'package.json')
+            requirements_txt = os.path.join(repo_path, 'requirements.txt')
+            
+            if os.path.exists(package_json):
+                self.project_type = 'javascript'
+                self.test_command = ['npm', 'test', '--', '--passWithNoTests']
+                print("📦 Detected JavaScript/React project (package.json found)")
+            elif os.path.exists(requirements_txt):
+                self.project_type = 'python'
+                self.test_command = ['pytest', '--maxfail=10', '-v']
+                print("🐍 Detected Python project (requirements.txt found)")
+            else:
+                # Default to Python with pytest
+                self.project_type = 'unknown'
+                self.test_command = ['pytest', '--maxfail=10', '-v']
+                print("⚠️  Could not detect project type, defaulting to Python/pytest")
     
     def _create_venv(self, repo_path: str):
         """Create a virtual environment for the Python project"""
@@ -199,7 +300,8 @@ class DockerRunner:
                         'npm install',
                         cwd=repo_path,
                         capture_output=True,
-                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
                         shell=True,
                         timeout=300  # 5 minute timeout
                     )
@@ -223,7 +325,8 @@ class DockerRunner:
                         pip_cmd + ['install', '-r', 'requirements.txt'],
                         cwd=repo_path,
                         capture_output=True,
-                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
                         timeout=300  # 5 minute timeout
                     )
                     print("✅ Dependencies installed successfully in isolated environment")
@@ -235,9 +338,63 @@ class DockerRunner:
             print("⚠️  No dependencies file found, skipping installation")
     
     def _run_tests(self, repo_path: str) -> str:
-        """Run tests based on project type and return output"""
-        test_cmd_str = ' '.join(self.test_command)
-        print(f"Running tests with: {test_cmd_str}")
+        """Run tests using Docker container or local execution"""
+        
+        # Use Docker if available (for any language that has Docker support)
+        if self.use_docker:
+            return self._run_tests_docker(repo_path)
+        else:
+            return self._run_tests_local(repo_path)
+    
+    def _run_tests_docker(self, repo_path: str) -> str:
+        """Run tests in Docker container (preferred method)"""
+        print(f"🐳 Running tests in Docker container...")
+        
+        # Flag to track if process is still running
+        process_running = {'status': True}
+        
+        # Function to send periodic progress updates
+        def send_progress_updates():
+            elapsed = 0
+            while process_running['status'] and elapsed < 180:
+                time.sleep(15)  # Send update every 15 seconds
+                elapsed += 15
+                if process_running['status']:
+                    self._emit_progress("info", f"⏳ Container still running... ({elapsed}s elapsed)")
+        
+        # Start progress update thread
+        progress_thread = threading.Thread(target=send_progress_updates, daemon=True)
+        progress_thread.start()
+        
+        try:
+            # Run tests in Docker container
+            output, returncode = self.docker_executor.run_tests_in_container(repo_path)
+            
+            # Log test result
+            if returncode == 0:
+                print("✅ Tests passed in container")
+                self._emit_progress("success", "✅ Tests completed successfully")
+            else:
+                print(f"❌ Tests failed with exit code {returncode}")
+                self._emit_progress("info", f"📋 Tests completed with {returncode} failures")
+            
+            return output
+            
+        except Exception as e:
+            print(f"❌ Docker execution error: {e}")
+            self._emit_progress("error", f"❌ Docker error: {str(e)}")
+            print("⚠️  Falling back to local execution...")
+            self.use_docker = False
+            return self._run_tests_local(repo_path)
+            
+        finally:
+            process_running['status'] = False
+    
+    def _run_tests_local(self, repo_path: str) -> str:
+        """Run tests locally (fallback method)"""
+        print(f"💻 Running tests locally...")
+        test_cmd_str = ' '.join(self.test_command) if self.test_command else 'pytest'
+        print(f"Command: {test_cmd_str}")
         
         # Flag to track if process is still running
         process_running = {'status': True}
@@ -256,26 +413,28 @@ class DockerRunner:
         progress_thread.start()
         
         try:
-            # For Python projects, use venv's python if available
-            if self.project_type == 'python':
-                # Use venv's python -m pytest to isolate from system packages
-                python_exe = self.venv_python if self.venv_python else 'python'
-                cmd = [python_exe, '-m', 'pytest', '--maxfail=10', '-v', '--tb=short']
-                print(f"Using Python: {python_exe}")
+            # Get test command from language plugin
+            if self.language_plugin:
+                cmd = self.language_plugin.get_test_command()
+                print(f"Using language plugin command: {' '.join(cmd)}")
+            # Fallback to project_type detection
+            elif self.project_type == 'python':
+                cmd = ['python', '-m', 'pytest', '--maxfail=10', '-v', '--tb=short']
             elif self.project_type == 'javascript':
-                cmd = ' '.join(self.test_command)
+                cmd = self.test_command if self.test_command else ['npm', 'test']
             else:
-                cmd = self.test_command
+                cmd = self.test_command if self.test_command else ['pytest', '--maxfail=10', '-v']
             
-            # Use Popen for better control and to avoid output buffering issues
+            # Use Popen for better control
             process = subprocess.Popen(
                 cmd,
                 cwd=repo_path,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                shell=(self.project_type == 'javascript'),  # Use shell for npm on Windows
-                bufsize=1  # Line buffered
+                encoding='utf-8',
+                errors='replace',
+                shell=(self.project_type == 'javascript'),
+                bufsize=1
             )
             
             # Wait for process with timeout
@@ -316,8 +475,8 @@ class DockerRunner:
         print(f"Attempting to fix {error.type} in {error.file}:{error.line}")
         self._emit_progress("fixing", f"🔧 Fixing {error.type.value} in {os.path.basename(error.file)}:{error.line}")
         
-        # Apply fix
-        success = self.fixer.apply_fix(error)
+        # Apply fix using language plugin
+        success = self.language_plugin.fix_error(error)
         
         if success:
             # Commit the fix

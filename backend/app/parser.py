@@ -57,8 +57,11 @@ class ErrorParser:
             ],
         }
         
-        # Pattern to extract file and line number
+        # Patterns to extract file and line number
+        # Pattern 1: Python traceback format: File "path", line 123
         self.file_line_pattern = r'File "(.*?)", line (\d+)'
+        # Pattern 2: pytest/compiler format: path:123: Error
+        self.pytest_pattern = r'^\s*([/\\]?[\w/\\.-]+\.py):(\d+):'
     
     def parse_errors(self, test_output: str, repo_path: str = None) -> List[ErrorInfo]:
         """Parse test output and return structured error information"""
@@ -71,8 +74,12 @@ class ErrorParser:
         print(f"[PARSER] Parsing errors from test output (repo_path={repo_path})")
         
         for i, line in enumerate(lines):
-            # Try to extract file and line number
+            # Try to extract file and line number (Python traceback format)
             file_match = re.search(self.file_line_pattern, line)
+            
+            # If not found, try pytest format
+            if not file_match:
+                file_match = re.search(self.pytest_pattern, line)
             if file_match:
                 current_file = file_match.group(1)
                 current_line = int(file_match.group(2))
@@ -84,9 +91,22 @@ class ErrorParser:
                     print(f"[PARSER] ❌ Skipped (frozen/builtin): {current_file}")
                     continue
                 
+                # CRITICAL: Convert Docker container paths to host paths
+                import os
+                
+                # If path is from Docker container (/workspace/...), convert it to host path
+                if current_file.startswith('/workspace'):
+                    if repo_path:
+                        # Remove /workspace prefix and convert to host path
+                        relative_path = current_file[len('/workspace'):].lstrip('/')
+                        current_file = os.path.join(repo_path, relative_path)
+                        print(f"[PARSER] 🐳 Converted container path to host: {current_file}")
+                    else:
+                        print(f"[PARSER] ❌ Skipped (container path, no repo_path): {current_file}")
+                        continue
+                
                 # CRITICAL: Only include errors from the actual repository
                 # Skip system libraries, site-packages, Python stdlib
-                import os
                 
                 # Check if path is absolute or relative
                 is_absolute = os.path.isabs(current_file)

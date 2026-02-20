@@ -2,14 +2,19 @@ import os
 import shutil
 import stat
 import time
+import subprocess
+import sys
 from git import Repo, GitCommandError
 from typing import Optional
 
 
 def remove_readonly(func, path, excinfo):
     """Error handler for Windows readonly files"""
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
 
 
 class GitHandler:
@@ -20,41 +25,87 @@ class GitHandler:
         self.repo: Optional[Repo] = None
         self.repo_path: Optional[str] = None
     
+    def _force_remove_windows(self, path: str) -> bool:
+        """Force remove directory using Windows-specific commands"""
+        if sys.platform != 'win32':
+            return False
+        
+        try:
+            # Use Windows rmdir /s /q command which is more aggressive
+            subprocess.run(['cmd', '/c', 'rmdir', '/s', '/q', path], 
+                         check=False, timeout=30, capture_output=True)
+            time.sleep(0.5)
+            return not os.path.exists(path)
+        except Exception as e:
+            print(f"Windows force remove failed: {e}")
+            return False
+    
     def clone_repo(self, repo_url: str) -> str:
         """Clone repository and return local path"""
         # Extract repo name from URL
         repo_name = repo_url.rstrip('/').split('/')[-1].replace('.git', '')
         repo_path = os.path.join(self.workspace_dir, repo_name)
         
+        # Close any existing Git repository connection
+        if self.repo and hasattr(self.repo, 'close'):
+            try:
+                self.repo.close()
+            except:
+                pass
+        self.repo = None
+        
         # ALWAYS start fresh - remove existing directory to avoid stale files
         if os.path.exists(repo_path):
             print(f"Removing existing repository at {repo_path} to start fresh...")
-            max_attempts = 3
-            for attempt in range(max_attempts):
-                try:
-                    # On Windows, use onerror to handle readonly files
-                    shutil.rmtree(repo_path, onerror=remove_readonly)
-                    print(f"✓ Successfully removed old repository")
-                    break
-                except Exception as e:
-                    if attempt < max_attempts - 1:
-                        print(f"Attempt {attempt + 1} failed, retrying... ({e})")
-                        time.sleep(1)
-                    else:
-                        print(f"❌ Could not remove directory after {max_attempts} attempts: {e}")
-                        raise Exception(f"Failed to clean workspace directory: {e}")
+            removed = False
             
-            # Verify it's gone
+            # Attempt 1: Standard shutil with readonly handler
+            try:
+                shutil.rmtree(repo_path, onerror=remove_readonly)
+                time.sleep(0.5)
+                if not os.path.exists(repo_path):
+                    print(f"✓ Successfully removed old repository")
+                    removed = True
+            except Exception as e:
+                print(f"Standard removal failed: {e}")
+            
+            # Attempt 2: Windows-specific forceful deletion
+            if not removed and sys.platform == 'win32':
+                print("Trying Windows force removal...")
+                removed = self._force_remove_windows(repo_path)
+                if removed:
+                    print(f"✓ Successfully removed with Windows command")
+            
+            # Attempt 3: Rename and ignore (last resort)
+            if not removed:
+                try:
+                    backup_path = f"{repo_path}_old_{int(time.time())}"
+                    print(f"⚠️ Could not delete, renaming to {backup_path}")
+                    os.rename(repo_path, backup_path)
+                    removed = True
+                except Exception as e:
+                    print(f"Rename failed: {e}")
+            
+            # If still not removed, fail gracefully
             if os.path.exists(repo_path):
-                raise Exception(f"Directory still exists after deletion: {repo_path}")
+                print(f"⚠️ Warning: Could not fully remove old directory, will try to clone anyway...")
         
         # Clone the repository fresh from GitHub
         print(f"Cloning repository from {repo_url}...")
-        self.repo = Repo.clone_from(repo_url, repo_path)
-        self.repo_path = repo_path
-        print(f"Repository cloned to {repo_path}")
-        
-        return repo_path
+        try:
+            self.repo = Repo.clone_from(repo_url, repo_path)
+            self.repo_path = repo_path
+            print(f"Repository cloned to {repo_path}")
+            return repo_path
+        except Exception as e:
+            # If clone fails and directory exists, try one more cleanup
+            if os.path.exists(repo_path):
+                print(f"Clone failed, cleaning up partial clone...")
+                try:
+                    shutil.rmtree(repo_path, onerror=remove_readonly)
+                except:
+                    pass
+            raise Exception(f"Failed to clone repository: {e}")
     
     def create_branch(self, team: str, leader: str) -> str:
         """Create and checkout new branch with specified naming format"""
@@ -138,3 +189,17 @@ class GitHandler:
         if not self.repo:
             return False
         return self.repo.is_dirty()
+    
+    def close(self):
+        """Close Git repository and release file handles"""
+        if self.repo:
+            try:
+                # Close the repository to release file handles
+                self.repo.close()
+            except:
+                pass
+            self.repo = None
+    
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        self.close()

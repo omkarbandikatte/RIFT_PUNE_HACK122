@@ -1,0 +1,29 @@
+FROM node:18-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set working directory
+WORKDIR /workspace
+
+# node:18-slim already has 'node' user with UID 1000
+# Just use that user instead of creating new one
+RUN chown -R node:node /workspace
+
+# Copy entrypoint script
+COPY docker/agent_entrypoint_node.py /usr/local/bin/entrypoint.py
+RUN chmod +x /usr/local/bin/entrypoint.py
+
+# Switch to non-root user
+USER node
+
+# Set environment variables
+ENV NODE_ENV=test
+ENV CI=true
+ENV PYTHONUNBUFFERED=1
+
+# Entrypoint will install deps and run tests
+ENTRYPOINT ["python3", "/usr/local/bin/entrypoint.py"]
