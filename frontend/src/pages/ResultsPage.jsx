@@ -156,6 +156,26 @@ export function ResultsPage() {
         </CardContent>
       </Card>
 
+      {/* Error Details (if FAILED) */}
+      {run.status === 'FAILED' && run.error_message && (
+        <Card className="border-red-200 bg-red-50">
+          <CardHeader>
+            <CardTitle className="text-red-700 flex items-center gap-2">
+              <XCircle className="h-5 w-5" />
+              Error Details
+            </CardTitle>
+            <CardDescription className="text-red-600">
+              The agent failed to complete this run. See details below:
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <pre className="text-sm font-mono bg-white p-4 rounded border border-red-200 overflow-x-auto whitespace-pre-wrap break-words">
+              {run.error_message}
+            </pre>
+          </CardContent>
+        </Card>
+      )}
+
       {/* Fixes Applied */}
       <Card>
         <CardHeader>

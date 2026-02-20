@@ -34,6 +34,7 @@ class AgentRun(Base):
     iterations = Column(Integer, default=0)
     fixes = Column(JSON)  # List of fix details
     duration = Column(String, nullable=True)
+    error_message = Column(Text, nullable=True)  # Error details if FAILED
     created_at = Column(DateTime, default=datetime.utcnow)
     
     user = relationship("User", back_populates="runs")

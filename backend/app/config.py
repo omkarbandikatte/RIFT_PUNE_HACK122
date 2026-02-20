@@ -16,7 +16,8 @@ MAX_RETRIES = 5
 TEST_COMMAND = ["pytest", "--maxfail=10", "-v"]
 
 # Database
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/aidevops")
+DATABASE_URL = os.getenv("DATABASE_URL")
+print("DATABASE_URL:", DATABASE_URL)
 
 # GitHub OAuth
 GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID", "")

@@ -11,7 +11,7 @@ export const useAgentProgress = (runId) => {
 
     // Connect to WebSocket
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//localhost:8000/ws/runs/${runId}`;
+    const wsUrl = `${protocol}//cicdagentapi.onrender.com/ws/runs/${runId}`;
     
     console.log(`🔌 Connecting to WebSocket: ${wsUrl}`);
     
