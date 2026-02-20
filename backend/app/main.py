@@ -321,12 +321,17 @@ async def run_agent(
         
     except Exception as e:
         # Update run status to FAILED
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"❌ Run #{run_id} failed: {str(e)}")
+        print(error_details)
+        
         duration = str(datetime.utcnow() - start_time).split('.')[0]
         agent_run.status = "FAILED"
         agent_run.duration = duration
+        agent_run.error_message = f"{str(e)}\n\nStacktrace:\n{error_details}"
         db.commit()
         
-        print(f"❌ Run #{run_id} failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Agent execution failed: {str(e)}")
 
 
@@ -409,8 +414,9 @@ async def run_agent_async(
                 bg_db.close()
         except Exception as e:
             import traceback
+            error_details = traceback.format_exc()
             print(f"❌ [ASYNC] Run #{run_id} failed with exception:")
-            traceback.print_exc()
+            print(error_details)
             ws_manager.send_progress_sync(run_id, "error", f"❌ Failed: {str(e)}")
             from app.database import SessionLocal
             bg_db = SessionLocal()
@@ -420,6 +426,7 @@ async def run_agent_async(
                 if bg_run:
                     bg_run.status = "FAILED"
                     bg_run.duration = duration
+                    bg_run.error_message = f"{str(e)}\n\nDetails:\n{error_details}"
                     bg_db.commit()
                 ws_manager.send_progress_sync(run_id, "error", f"❌ Failed: {str(e)}")
             finally:
