@@ -17,7 +17,11 @@ export function LoginPage() {
   }, [isAuthenticated, navigate]);
 
   const handleGithubLogin = () => {
-    window.location.href = githubAuth.getAuthUrl();
+    const authUrl = githubAuth.getAuthUrl();
+    console.log('🔍 Auth URL:', authUrl);
+    console.log('🔍 Redirect URI:', import.meta.env.VITE_GITHUB_REDIRECT_URI);
+    console.log('🔍 Client ID:', import.meta.env.VITE_GITHUB_CLIENT_ID);
+    window.location.href = authUrl;
   };
 
   return (
